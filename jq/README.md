@@ -12,14 +12,19 @@ cc -O2 -o batsc batsc.c
 
 ## Run
 
-Run from the directory containing the solution file. Two exercises are
-included with example solutions: `two-fer` (the simplest shape) and
-`regular-chatbot` (multi-line jq programs, `<<<` here-strings, `include`,
-and `${#lines[@]}`).
+Each exercise lives in its own folder with `test.bats` and a sample
+solution named as the test expects. Two are included: `two-fer` (the
+simplest shape) and `regular-chatbot` (multi-line jq programs, `<<<`
+here-strings, `include`, and `${#lines[@]}`).
+
+Run from inside the exercise folder:
 
 ```sh
-BATS_RUN_SKIPPED=true ./batsc test-two-fer.bats > results.json
-BATS_RUN_SKIPPED=true ./batsc test-regular-chatbot.bats | jq .
+cd two-fer
+BATS_RUN_SKIPPED=true ../batsc test.bats > results.json
+
+cd ../regular-chatbot
+BATS_RUN_SKIPPED=true ../batsc test.bats | jq .
 ```
 
 Setting `BATS_RUN_SKIPPED=true` runs every test. Without it, tests guarded
