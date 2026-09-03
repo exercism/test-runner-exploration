@@ -5,7 +5,8 @@
  *   cc -O2 -o batsc batsc.c
  *   BATS_RUN_SKIPPED=true ./batsc test-two-fer.bats > results.json
  *
- * Supported: @test '...' { ... }, run CMD [<< 'TAG' heredoc], VAR='...' / VAR="...",
+ * Supported: @test '...' { ... }, run CMD [<< TAG heredoc | <<< 'string'] (args may span
+ *            lines inside quotes or with a trailing backslash), VAR='...' / VAR="...", ${#lines[@]},
  *            skip, `[[ ... ]] || skip`, assert_success, assert_failure,
  *            assert_equal, assert_output [--partial], refute_output, assert_line [--index N].
  * Anything else inside a test is reported as an error (never silently passed).
@@ -35,6 +36,7 @@ static char *xstrdup(const char *s) { char *d = strdup(s); if (!d) { perror("str
 static const char *getvar(const char *k) {
     if (!strcmp(k, "output")) return output ? output : "";
     if (!strcmp(k, "status")) { static char b[16]; snprintf(b, sizeof b, "%d", status); return b; }
+    if (!strcmp(k, "#lines[@]")) { static char b[16]; snprintf(b, sizeof b, "%d", nlines); return b; }
     if (!strncmp(k, "lines[", 6)) { int i = atoi(k + 6); return (i >= 0 && i < nlines) ? lines_arr[i] : ""; }
     for (int i = 0; i < nvars; i++) if (!strcmp(vars[i].k, k)) return vars[i].v;
     const char *e = getenv(k);
@@ -56,12 +58,17 @@ static void bputs(buf *b, const char *s) { while (*s) bput(b, *s++); }
 /* ---------- shell-ish word splitting ---------- */
 /* Splits `line` into argv honouring '...', "..." (with $var / ${var} expansion) and \ escapes.
  * Stops at `<<` and returns the heredoc tag via *heredoc (or NULL). */
-static int split_words(const char *line, char **argv, char **heredoc) {
-    int argc = 0; *heredoc = NULL;
+static int split_words(const char *line, char **argv, char **heredoc, char **herestring) {
+    int argc = 0; *heredoc = NULL; if (herestring) *herestring = NULL;
     const char *p = line;
     while (*p) {
         while (isspace((unsigned char)*p)) p++;
         if (!*p) break;
+        if (p[0] == '<' && p[1] == '<' && p[2] == '<') {   /* here-string: <<< 'text' */
+            char *sub[2], *dummy; p += 3;
+            if (split_words(p, sub, &dummy, NULL) && herestring) *herestring = sub[0];
+            break;
+        }
         if (p[0] == '<' && p[1] == '<') {           /* heredoc: << 'TAG' | << "TAG" | << TAG | <<- */
             p += 2; if (*p == '-') p++;
             while (isspace((unsigned char)*p)) p++;
@@ -146,19 +153,44 @@ static void fail(test_t *t, int state, const char *fmt, ...) {
 
 static int is_word(const char *s, const char *w) { return !strcmp(s, w); }
 
+/* Does `s` end inside an open quote, or with a line continuation? */
+static int statement_continues(const char *s) {
+    char q = 0; size_t len = strlen(s);
+    for (const char *p = s; *p; p++) {
+        if (q) { if (*p == q) q = 0; else if (q == '"' && *p == '\\' && p[1]) p++; }
+        else if (*p == '\'' || *p == '"') q = *p;
+        else if (*p == '\\' && p[1]) p++;
+        else if (*p == '#') break;
+    }
+    return q || (len && s[len - 1] == '\\' && !q);
+}
+
+/* Join body[*i..] into one logical statement while quotes are open or a line ends in `\`. */
+static char *join_statement(char **body, int *i, int n) {
+    buf b = {0}; bput(&b, 0); b.n = 0;
+    bputs(&b, body[*i]);
+    while (statement_continues(b.s) && *i + 1 < n) {
+        if (b.n && b.s[b.n - 1] == '\\') b.s[--b.n] = 0;   /* drop the continuation backslash */
+        else bput(&b, '\n');                                /* keep newlines inside quotes */
+        bputs(&b, body[++*i]);
+    }
+    return b.s;
+}
+
 /* Execute one test body (array of lines). */
 static void exec_test(test_t *t, char **body, int n) {
     for (int i = 0; i < n && t->state == 0; i++) {
-        const char *line = body[i];
+        char *joined = join_statement(body, &i, n);
+        const char *line = joined;
         while (isspace((unsigned char)*line)) line++;
-        if (!*line || *line == '#') continue;
+        if (!*line || *line == '#') { free(joined); continue; }
 
         /* skip guards */
         if (strstr(line, "|| skip")) {
             /* `[[ $BATS_RUN_SKIPPED == "true" ]] || skip` : skip unless the env var says run everything */
             const char *e = getenv("BATS_RUN_SKIPPED");
             if (!(e && !strcmp(e, "true"))) { t->state = 3; return; }
-            continue;
+            free(joined); continue;
         }
         if (is_word(line, "skip") || !strncmp(line, "skip ", 5)) { t->state = 3; return; }
 
@@ -168,13 +200,13 @@ static void exec_test(test_t *t, char **body, int n) {
             int ok = 1; for (const char *q = line; q < eq; q++) if (!(isalnum((unsigned char)*q) || *q == '_')) { ok = 0; break; }
             if (ok && eq > line) {
                 char name[64]; snprintf(name, sizeof name, "%.*s", (int)(eq - line), line);
-                char *av[MAXARGS], *hd; int ac = split_words(eq + 1, av, &hd);
+                char *av[MAXARGS], *hd; int ac = split_words(eq + 1, av, &hd, NULL);
                 setvar(name, ac ? av[0] : "");
-                continue;
+                free(joined); continue;
             }
         }
 
-        char *av[MAXARGS], *hd; int ac = split_words(line, av, &hd);
+        char *av[MAXARGS], *hd, *hs; int ac = split_words(line, av, &hd, &hs);
         if (ac == 0) continue;
 
         if (is_word(av[0], "run")) {
@@ -187,6 +219,9 @@ static void exec_test(test_t *t, char **body, int n) {
                     if (!strcmp(l, hd)) break;
                     bputs(&b, body[i]); bput(&b, '\n');
                 }
+                stdin_data = b.s;
+            } else if (hs) {
+                buf b = {0}; bput(&b, 0); b.n = 0; bputs(&b, hs); bput(&b, '\n');
                 stdin_data = b.s;
             }
             run_cmd(av + 1, stdin_data);
@@ -222,6 +257,7 @@ static void exec_test(test_t *t, char **body, int n) {
             if (!hit) fail(t, 1, "line not found\nexpected : %s\noutput   : %s", exp, output);
         }
         else fail(t, 2, "unsupported statement: %s", line);
+        free(joined);
     }
 }
 
@@ -249,7 +285,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < n; i++) {
         const char *l = lines[i];
         if (strncmp(l, "@test", 5)) continue;
-        char *av[MAXARGS], *hd; split_words(l, av, &hd);
+        char *av[MAXARGS], *hd; split_words(l, av, &hd, NULL);
         test_t *t = &tests[ntests++];
         t->name = xstrdup(av[1] ? av[1] : "?"); t->state = 0; t->message = NULL;
         int start = ++i; buf code = {0}; bput(&code, 0); code.n = 0;

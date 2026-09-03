@@ -12,10 +12,14 @@ cc -O2 -o batsc batsc.c
 
 ## Run
 
-From the directory containing the student's `two-fer.jq`:
+Run from the directory containing the solution file. Two exercises are
+included with example solutions: `two-fer` (the simplest shape) and
+`regular-chatbot` (multi-line jq programs, `<<<` here-strings, `include`,
+and `${#lines[@]}`).
 
 ```sh
 BATS_RUN_SKIPPED=true ./batsc test-two-fer.bats > results.json
+BATS_RUN_SKIPPED=true ./batsc test-regular-chatbot.bats | jq .
 ```
 
 Setting `BATS_RUN_SKIPPED=true` runs every test. Without it, tests guarded
@@ -38,7 +42,9 @@ Exercism results.json (version 2) on stdout.
 
 ## Supported statements
 
-- `run CMD ...` with an optional heredoc
+- `run CMD ...` with an optional `<< TAG` heredoc or `<<< 'string'` here-string.
+  Arguments may span lines inside quotes or via a trailing backslash.
+- `${#lines[@]}` for the number of output lines
 - `VAR='...'` and `VAR="..."` assignments
 - `skip` and `... || skip`
 - `assert_success`, `assert_failure [STATUS]`
