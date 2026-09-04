@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+unset CDPATH
+batsc="$(cd "$(dirname "$0")/.." && pwd -P)/batsc"
+cd "$(dirname "$0")/../exercises"
+if ! [[ -x $batsc ]]; then
+    echo "Compile batsc first! Read the readme"
+    exit 1
+fi
+
+for e in ./*/; do
+    cd "$e" || exit 2
+    BATS_RUN_SKIPPED=true $batsc ./test*.bats > results.json 2>&1
+    rc=$?
+    echo "$rc $e"
+    if (( rc != 0 )); then
+        jq . results.json
+        echo
+    fi
+    cd "$OLDPWD"
+done
