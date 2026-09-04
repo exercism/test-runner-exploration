@@ -7,7 +7,7 @@ environments that only have a C compiler and `jq`.
 ## Build
 
 ```sh
-cc -O2 -o batsc batsc.c
+cc -O2 -o batsc batsc.c -lm
 ```
 
 ## Run
@@ -47,15 +47,32 @@ Exercism results.json (version 2) on stdout.
 
 ## Supported statements
 
-- `run CMD ...` with an optional `<< TAG` heredoc or `<<< 'string'` here-string.
-  Arguments may span lines inside quotes or via a trailing backslash.
+- `run CMD ...` with an optional `<< TAG` heredoc, `<<< 'string'` here-string,
+  or `< file` stdin redirect. Arguments may span lines inside quotes or via a
+  trailing backslash, and `$'...'` ANSI-C quoting is understood.
 - `${#lines[@]}` for the number of output lines
 - `VAR='...'` and `VAR="..."` assignments
+- `VAR=$(CMD << TAG ... TAG )` command substitution over a heredoc, as used
+  for multi-line expected output (`cat`, `jq -c .`, and so on)
 - `skip` and `... || skip`
 - `assert_success`, `assert_failure [STATUS]`
 - `assert_equal A B`
 - `assert_output [--partial] STR`, `refute_output [--partial] STR`
 - `assert_line [--index N] STR`
+
+And the extra assertions from the track's `bats-jq.bash`:
+
+- `assert_objects_equal JSON JSON` (compared via `jq`, so key order is ignored)
+- `assert_float [-d N] [--] A B` (equal after truncating to N decimals, default 2)
+- `assert_key_value KEY VALUE` (looks up KEY in the JSON `$output`)
+
+As in `bats-jq.bash`, stderr lines starting with `["DEBUG:",` are treated as
+diagnostics and dropped from `$output`.
+
+## Coverage
+
+Running the example solutions for every exercise in the jq track
+(77 exercises, 1029 tests) through `batsc` passes them all.
 
 Anything else inside a test marks it as `error` rather than passing silently.
 

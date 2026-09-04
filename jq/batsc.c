@@ -7,8 +7,10 @@
  *
  * Supported: @test '...' { ... }, run CMD [<< TAG heredoc | <<< 'string'] (args may span
  *            lines inside quotes or with a trailing backslash), VAR='...' / VAR="...", ${#lines[@]},
- *            skip, `[[ ... ]] || skip`, assert_success, assert_failure,
- *            assert_equal, assert_output [--partial], refute_output, assert_line [--index N].
+ *            VAR=$(CMD << TAG ... TAG ), `< file` stdin redirection, skip, `[[ ... ]] || skip`, assert_success, assert_failure,
+ *            assert_equal, assert_output [--partial], refute_output, assert_line [--index N],
+ *            and from bats-jq.bash: assert_objects_equal, assert_float [-d N], assert_key_value.
+ *            stderr lines starting with `["DEBUG:",` are dropped from $output, as bats-jq.bash does.
  * Anything else inside a test is reported as an error (never silently passed).
  */
 #include <stdio.h>
@@ -18,6 +20,7 @@
 #include <sys/wait.h>
 #include <ctype.h>
 #include <stdarg.h>
+#include <math.h>
 
 #define MAXLINES 4096
 #define MAXVARS  64
@@ -58,8 +61,9 @@ static void bputs(buf *b, const char *s) { while (*s) bput(b, *s++); }
 /* ---------- shell-ish word splitting ---------- */
 /* Splits `line` into argv honouring '...', "..." (with $var / ${var} expansion) and \ escapes.
  * Stops at `<<` and returns the heredoc tag via *heredoc (or NULL). */
+static char *stdin_file;   /* set by split_words when it sees `< file` */
 static int split_words(const char *line, char **argv, char **heredoc, char **herestring) {
-    int argc = 0; *heredoc = NULL; if (herestring) *herestring = NULL;
+    int argc = 0; *heredoc = NULL; if (herestring) *herestring = NULL; stdin_file = NULL;
     const char *p = line;
     while (*p) {
         while (isspace((unsigned char)*p)) p++;
@@ -67,6 +71,11 @@ static int split_words(const char *line, char **argv, char **heredoc, char **her
         if (p[0] == '<' && p[1] == '<' && p[2] == '<') {   /* here-string: <<< 'text' */
             char *sub[2], *dummy; p += 3;
             if (split_words(p, sub, &dummy, NULL) && herestring) *herestring = sub[0];
+            break;
+        }
+        if (p[0] == '<' && p[1] != '<') {           /* stdin redirect: < file */
+            char *sub[2], *dummy; p++;
+            if (split_words(p, sub, &dummy, NULL)) stdin_file = sub[0];
             break;
         }
         if (p[0] == '<' && p[1] == '<') {           /* heredoc: << 'TAG' | << "TAG" | << TAG | <<- */
@@ -80,7 +89,23 @@ static int split_words(const char *line, char **argv, char **heredoc, char **her
         }
         buf w = {0}; bput(&w, 0); w.n = 0;           /* make sure w.s is non-NULL even for "" */
         while (*p && !isspace((unsigned char)*p)) {
-            if (*p == '\'') { p++; while (*p && *p != '\'') bput(&w, *p++); if (*p) p++; }
+            if (*p == '$' && p[1] == '\'') {           /* $'...' ANSI-C quoting */
+                p += 2;
+                while (*p && *p != '\'') {
+                    if (*p == '\\' && p[1]) {
+                        p++;
+                        switch (*p) {
+                        case 'n': bput(&w, '\n'); break; case 't': bput(&w, '\t'); break;
+                        case 'r': bput(&w, '\r'); break; case 'e': bput(&w, 27); break;
+                        case 'a': bput(&w, 7); break;    case '0': bput(&w, 0); break;
+                        default: bput(&w, *p);
+                        }
+                        p++;
+                    } else bput(&w, *p++);
+                }
+                if (*p) p++;
+            }
+            else if (*p == '\'') { p++; while (*p && *p != '\'') bput(&w, *p++); if (*p) p++; }
             else if (*p == '"') {
                 p++;
                 while (*p && *p != '"') {
@@ -110,35 +135,73 @@ static int split_words(const char *line, char **argv, char **heredoc, char **her
     return argc;
 }
 
-/* ---------- run: fork/exec with stdin from heredoc, capture stdout+stderr ---------- */
-static void run_cmd(char **argv, const char *stdin_data) {
-    int in[2], out[2];
-    if (pipe(in) || pipe(out)) { perror("pipe"); exit(1); }
+/* ---------- run: fork/exec with stdin from data, capture stdout and stderr ---------- */
+/* Runs argv, feeding stdin_data (may be NULL). Returns the exit status; *out gets stdout and
+ * *err gets stderr (both malloc'd, trailing newlines intact). */
+static int capture(char **argv, const char *stdin_data, char **out, char **err) {
+    int in[2], outp[2];
+    char errpath[] = "/tmp/batsc-err-XXXXXX";
+    int errfd = mkstemp(errpath);
+    if (errfd < 0 || pipe(in) || pipe(outp)) { perror("pipe"); exit(1); }
     pid_t pid = fork();
     if (pid < 0) { perror("fork"); exit(1); }
     if (pid == 0) {
-        dup2(in[0], 0); dup2(out[1], 1); dup2(out[1], 2);   /* bats `run` merges stderr into $output */
-        close(in[0]); close(in[1]); close(out[0]); close(out[1]);
+        dup2(in[0], 0); dup2(outp[1], 1); dup2(errfd, 2);
+        if (stdin_file) { FILE *sf = fopen(stdin_file, "r"); if (sf) dup2(fileno(sf), 0); else { perror(stdin_file); _exit(1); } }
+        close(in[0]); close(in[1]); close(outp[0]); close(outp[1]); close(errfd);
         execvp(argv[0], argv);
         fprintf(stderr, "%s: command not found\n", argv[0]); _exit(127);
     }
-    close(in[0]); close(out[1]);
+    close(in[0]); close(outp[1]);
     /* NB: fine for small inputs; a large heredoc + large output would need poll() to avoid deadlock */
     if (stdin_data) { size_t len = strlen(stdin_data); (void)!write(in[1], stdin_data, len); }
     close(in[1]);
     buf b = {0}; bput(&b, 0); b.n = 0;
     char tmp[4096]; ssize_t r;
-    while ((r = read(out[0], tmp, sizeof tmp)) > 0) for (ssize_t i = 0; i < r; i++) bput(&b, tmp[i]);
-    close(out[0]);
+    while ((r = read(outp[0], tmp, sizeof tmp)) > 0) for (ssize_t i = 0; i < r; i++) bput(&b, tmp[i]);
+    close(outp[0]);
     int ws; waitpid(pid, &ws, 0);
-    status = WIFEXITED(ws) ? WEXITSTATUS(ws) : 128 + WTERMSIG(ws);
-    while (b.n && b.s[b.n - 1] == '\n') b.s[--b.n] = 0;        /* like $(...) */
+    buf e = {0}; bput(&e, 0); e.n = 0;
+    lseek(errfd, 0, SEEK_SET);
+    while ((r = read(errfd, tmp, sizeof tmp)) > 0) for (ssize_t i = 0; i < r; i++) bput(&e, tmp[i]);
+    close(errfd); unlink(errpath);
+    *out = b.s; *err = e.s;
+    return WIFEXITED(ws) ? WEXITSTATUS(ws) : 128 + WTERMSIG(ws);
+}
+
+/* Strip trailing newlines in place, like $(...) does. */
+static void chomp(char *s) { size_t n = strlen(s); while (n && s[n - 1] == '\n') s[--n] = 0; }
+
+/* bats `run`: sets $output, $status and ${lines[]}.
+ * Mirrors the jq() wrapper in bats-jq.bash: stderr lines starting with `["DEBUG:",` are
+ * diagnostic and dropped; remaining stderr lines come first, then stdout. */
+static void run_cmd(char **argv, const char *stdin_data) {
+    char *out, *err;
+    status = capture(argv, stdin_data, &out, &err);
+    buf b = {0}; bput(&b, 0); b.n = 0;
+    char *copy = xstrdup(err), *save = copy, *tok;
+    chomp(copy);
+    if (*copy) while ((tok = strsep(&copy, "\n")))
+        if (strncmp(tok, "[\"DEBUG:\",", 10)) { bputs(&b, tok); bput(&b, '\n'); }
+    free(save);
+    bputs(&b, out); free(out); free(err);
+    chomp(b.s); b.n = strlen(b.s);
     free(output); output = b.s;
     for (int i = 0; i < nlines; i++) free(lines_arr[i]);
     nlines = 0;
-    char *copy = xstrdup(output), *save = copy, *tok;
+    copy = xstrdup(output); save = copy;
     while ((tok = strsep(&copy, "\n")) && nlines < 1024) lines_arr[nlines++] = xstrdup(tok);
     free(save);
+}
+
+/* Run jq with the given args (NULL-terminated) and stdin; return chomped stdout. */
+static char *jq_capture(const char *stdin_data, ...) {
+    char *av[MAXARGS]; int ac = 0; av[ac++] = "jq";
+    va_list ap; va_start(ap, stdin_data);
+    char *a; while ((a = va_arg(ap, char *)) && ac < MAXARGS - 1) av[ac++] = a;
+    va_end(ap); av[ac] = NULL;
+    char *out, *err; capture(av, stdin_data, &out, &err); free(err);
+    chomp(out); return out;
 }
 
 /* ---------- test bookkeeping ---------- */
@@ -147,8 +210,8 @@ static test_t tests[256]; static int ntests;
 
 static void fail(test_t *t, int state, const char *fmt, ...) {
     if (t->state == 1 || t->state == 2) return;      /* keep first failure */
-    char m[8192]; va_list ap; va_start(ap, fmt); vsnprintf(m, sizeof m, fmt, ap); va_end(ap);
-    t->state = state; t->message = xstrdup(m);
+    char *m = NULL; va_list ap; va_start(ap, fmt); if (vasprintf(&m, fmt, ap) < 0) m = xstrdup("?"); va_end(ap);
+    t->state = state; t->message = m;
 }
 
 static int is_word(const char *s, const char *w) { return !strcmp(s, w); }
@@ -200,7 +263,27 @@ static void exec_test(test_t *t, char **body, int n) {
             int ok = 1; for (const char *q = line; q < eq; q++) if (!(isalnum((unsigned char)*q) || *q == '_')) { ok = 0; break; }
             if (ok && eq > line) {
                 char name[64]; snprintf(name, sizeof name, "%.*s", (int)(eq - line), line);
-                char *av[MAXARGS], *hd; int ac = split_words(eq + 1, av, &hd, NULL);
+                const char *val = eq + 1;
+                if (!strncmp(val, "$(", 2) && strstr(val, "<<")) {
+                    /* expected=$(CMD ... << TAG ... TAG  followed by a line with `)` */
+                    char *av[MAXARGS], *hd; int ac = split_words(val + 2, av, &hd, NULL);
+                    buf b = {0}; bput(&b, 0); b.n = 0;
+                    for (i++; i < n; i++) {
+                        if (!strcmp(body[i], hd ? hd : "")) break;
+                        bputs(&b, body[i]); bput(&b, '\n');
+                    }
+                    for (i++; i < n; i++) {          /* skip to the closing `)` */
+                        const char *l = body[i]; while (isspace((unsigned char)*l)) l++;
+                        if (*l == ')') break;
+                    }
+                    if (ac == 1 && is_word(av[0], "cat")) { chomp(b.s); setvar(name, b.s); }
+                    else {
+                        char *out, *err; capture(av, b.s, &out, &err);
+                        chomp(out); setvar(name, out); free(out); free(err);
+                    }
+                    free(b.s); free(joined); continue;
+                }
+                char *av[MAXARGS], *hd; int ac = split_words(val, av, &hd, NULL);
                 setvar(name, ac ? av[0] : "");
                 free(joined); continue;
             }
@@ -225,7 +308,7 @@ static void exec_test(test_t *t, char **body, int n) {
                 stdin_data = b.s;
             }
             run_cmd(av + 1, stdin_data);
-            free(stdin_data);
+            free(stdin_data); stdin_file = NULL;
         }
         else if (is_word(av[0], "assert_success")) {
             if (status != 0) fail(t, 1, "command failed with status %d\noutput: %s", status, output);
@@ -256,6 +339,37 @@ static void exec_test(test_t *t, char **body, int n) {
             else for (int j = 0; j < nlines; j++) if (!strcmp(lines_arr[j], exp)) hit = 1;
             if (!hit) fail(t, 1, "line not found\nexpected : %s\noutput   : %s", exp, output);
         }
+        /* --- assertions from bats-jq.bash --- */
+        else if (is_word(av[0], "assert_objects_equal")) {
+            if (ac < 3) { fail(t, 2, "assert_objects_equal needs two args"); }
+            else {
+                char *r = jq_capture(NULL, "-n", "--argjson", "actual", av[1], "--argjson", "expected", av[2],
+                                     "$actual == $expected", (char *)NULL);
+                if (strcmp(r, "true")) fail(t, 1, "objects do not equal\nexpected : %s\nactual   : %s", av[2], av[1]);
+                free(r);
+            }
+        }
+        else if (is_word(av[0], "assert_float")) {
+            int decimals = 2, k = 1;
+            if (k + 1 < ac && !strcmp(av[k], "-d")) { decimals = atoi(av[k + 1]); k += 2; }
+            else if (k < ac && !strncmp(av[k], "-d", 2)) { decimals = atoi(av[k] + 2); k++; }
+            if (k < ac && !strcmp(av[k], "--")) k++;
+            if (k + 1 >= ac) fail(t, 2, "assert_float needs two values");
+            else {
+                double m = pow(10, decimals);
+                double a = trunc(strtod(av[k], NULL) * m) / m, e = trunc(strtod(av[k + 1], NULL) * m) / m;
+                if (a != e) fail(t, 1, "values do not equal\nexpected : %.*f\nactual   : %.*f", decimals, e, decimals, a);
+            }
+        }
+        else if (is_word(av[0], "assert_key_value")) {
+            if (ac < 3) fail(t, 2, "assert_key_value needs key and value");
+            else {
+                buf in = {0}; bput(&in, 0); in.n = 0; bputs(&in, output ? output : ""); bput(&in, '\n');
+                char *r = jq_capture(in.s, "-rc", "--arg", "key", av[1], ".[$key]", (char *)NULL);
+                if (strcmp(r, av[2])) fail(t, 1, "values do not equal\nexpected : %s\nactual   : %s", av[2], r);
+                free(r); free(in.s);
+            }
+        }
         else fail(t, 2, "unsupported statement: %s", line);
         free(joined);
     }
@@ -277,8 +391,9 @@ static void jstr(const char *s) {
 int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s FILE.bats\n", argv[0]); return 2; }
     FILE *f = fopen(argv[1], "r"); if (!f) { perror(argv[1]); return 2; }
-    static char *lines[MAXLINES]; int n = 0; char lb[8192];
-    while (n < MAXLINES && fgets(lb, sizeof lb, f)) { lb[strcspn(lb, "\n")] = 0; lines[n++] = xstrdup(lb); }
+    static char *lines[MAXLINES]; int n = 0; char *lb = NULL; size_t cap = 0;
+    while (n < MAXLINES && getline(&lb, &cap, f) != -1) { lb[strcspn(lb, "\n")] = 0; lines[n++] = xstrdup(lb); }
+    free(lb);
     fclose(f);
 
     /* Parse: find `@test 'name' {` ... `}` blocks. Everything at top level (load, comments) is ignored. */
