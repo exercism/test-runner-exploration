@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+unset CDPATH
+cd "$(dirname "$0")/.."
+usage() {
+    cat << END_USAGE
+usage: $0 path/to/jq/track
+example: $0 ../../../tracks/jq
+END_USAGE
+    exit
+}
+
+(( $# == 1 )) || usage
+[[ -d $1 ]] || usage
+
+[[ -d ./exercises ]] && rm -r ./exercises/*/
+mkdir -p ./exercises
+
+for d in "$1"/exercises/practice/*; do
+    e=$(basename "$d")
+    mkdir exercises/"$e"
+    [[ $e == "eliuds-eggs" ]] && name=pop-count || name=$e
+    cp "$d"/*.bats exercises/"$e"
+    cp "$d"/.meta/example.jq exercises/"$e/$name.jq"
+done
